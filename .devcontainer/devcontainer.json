@@ -1,0 +1,14 @@
+{
+  "name": "revteth relay",
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:22",
+  "postCreateCommand": "npm install --no-audit --no-fund",
+  "postStartCommand": "bash ./start.sh",
+  "secrets": {
+    "RELAY_TOKEN": {
+      "description": "Password for the relay. Put the same value in the thin client's Token box. At least 16 characters."
+    },
+    "CF_TUNNEL_TOKEN": {
+      "description": "Your Cloudflare tunnel token (the long string after --token in Cloudflare's connector command)."
+    }
+  }
+}
