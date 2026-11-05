@@ -105,19 +105,79 @@ function parseTarget(s) {
   return m ? { host: m[1], port: Number(m[2]) } : { host: "", port: 0 };
 }
 
+// Overall limit across ALL streams, so many parallel downloads can't queue up
+// seconds of data in front of a slow link. It tracks how fast the page is
+// actually taking data and allows ~TARGET_QUEUE_S worth of it in flight.
+const TARGET_QUEUE_S = 0.15;
+const CHUNK = 64 * 1024; // the most a TCP socket hands us in one read
+const SMALL_STREAM = 256 * 1024; // below this, a stream counts as interactive
+const MIN_TOTAL = 256 * 1024;
+const MAX_TOTAL = 8 * 1024 * 1024;
+
 function handleMux(ws) {
   const streams = new Map();
+  const paused = []; // streams waiting for room, resumed round-robin
+  let total = 0; // bytes sent to the page and not yet credited, all streams
+  let limit = 1024 * 1024;
+  let delivered = 0; // credited bytes since the last rate sample
+  let rate = 0; // smoothed bytes/second the page is consuming
+
   const send = (b) => {
     if (ws.readyState === ws.OPEN) ws.send(b);
   };
+
+  const sampler = setInterval(() => {
+    const busy = total > 0 || paused.length > 0;
+    const sample = delivered / 0.25;
+    delivered = 0;
+    if (!busy) return; // idle: keep the last estimate
+    rate = rate ? 0.7 * rate + 0.3 * sample : sample;
+    limit = Math.min(MAX_TOTAL, Math.max(MIN_TOTAL, rate * TARGET_QUEUE_S));
+    resumeSome();
+  }, 250);
+
+  function pauseStream(s) {
+    if (s.paused) return;
+    s.paused = true;
+    s.sock.pause();
+    paused.push(s);
+  }
+
+  // A resumed socket can deliver up to one CHUNK before we can pause it again,
+  // so only resume as many streams as there is room for a full chunk each.
+  let armed = 0; // resumed streams that haven't delivered their next chunk yet
+  function resumeSome() {
+    for (let k = paused.length; k > 0 && total + (armed + 1) * CHUNK <= limit; k--) {
+      const s = paused.shift();
+      if (streams.get(s.id) !== s || !s.sock) continue; // closed meanwhile
+      if (s.inflight + CHUNK <= WINDOW) {
+        s.paused = false;
+        s.armed = true;
+        armed++;
+        s.sock.resume();
+      } else {
+        paused.push(s); // still over its own window; check again later
+      }
+    }
+  }
+  function disarm(s) {
+    if (s.armed) {
+      s.armed = false;
+      armed--;
+    }
+  }
 
   const closeStream = (id, reason, notify) => {
     const s = streams.get(id);
     if (!s) return;
     streams.delete(id);
     active--;
+    disarm(s);
+    total -= s.inflight; // credits for this stream will never come back
+    s.inflight = 0;
     s.sock?.destroy();
     if (notify) send(frame(T_CLOSE, id, Buffer.from(reason || "")));
+    resumeSome();
   };
 
   const writeToTarget = (id, s, payload) => {
@@ -128,7 +188,7 @@ function handleMux(ws) {
   };
 
   async function openStream(id, target) {
-    const s = { sock: null, pending: [], inflight: 0, paused: false };
+    const s = { id, sock: null, pending: [], inflight: 0, sent: 0, paused: false, armed: false };
     streams.set(id, s);
     active++;
     const { host, port } = parseTarget(target);
@@ -148,12 +208,17 @@ function handleMux(ws) {
     s.pending = null;
 
     sock.on("data", (chunk) => {
+      disarm(s);
       s.inflight += chunk.length;
+      s.sent += chunk.length;
+      total += chunk.length;
       send(frame(T_DATA, id, chunk));
-      if (s.inflight >= WINDOW && !s.paused) {
-        s.paused = true;
-        sock.pause();
-      }
+      // Pause at this stream's own window, or, for bulk transfers only, when
+      // there isn't room for another full chunk in the overall budget.
+      // Small/new connections (page loads, clicks) skip the overall budget, so
+      // they never wait behind big downloads.
+      const bulk = s.sent > SMALL_STREAM;
+      if (s.inflight + CHUNK > WINDOW || (bulk && total + (armed + 1) * CHUNK > limit)) pauseStream(s);
     });
     sock.on("error", (e) => closeStream(id, e.code || "connection error", true));
     sock.on("close", () => closeStream(id, "closed", true));
@@ -174,17 +239,18 @@ function handleMux(ws) {
       if (s.sock) writeToTarget(id, s, payload);
       else s.pending.push(payload); // still connecting
     } else if (type === T_CREDIT && s && payload.length >= 4) {
-      s.inflight -= payload.readUInt32BE(0);
-      if (s.paused && s.inflight < WINDOW) {
-        s.paused = false;
-        s.sock?.resume();
-      }
+      const n = Math.min(payload.readUInt32BE(0), s.inflight);
+      s.inflight -= n;
+      total -= n;
+      delivered += n;
+      resumeSome();
     } else if (type === T_CLOSE && s) {
       closeStream(id, "", false);
     }
   });
 
   ws.on("close", () => {
+    clearInterval(sampler);
     for (const id of [...streams.keys()]) closeStream(id, "", false);
   });
 }
