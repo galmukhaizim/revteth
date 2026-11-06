@@ -84,7 +84,7 @@ async function resolveTarget(host, port) {
 // small, so one big download can't make other connections lag.
 // ---------------------------------------------------------------------------
 const T_OPEN = 1, T_DATA = 2, T_CLOSE = 3, T_CREDIT = 4;
-const WINDOW = 512 * 1024;
+const WINDOW = 4 * 1024 * 1024; // per stream; the overall limit below keeps queues short
 const MAX_STREAMS = 1024;
 
 function frame(type, id, payload = Buffer.alloc(0)) {
@@ -131,7 +131,9 @@ function handleMux(ws) {
     const sample = delivered / 0.25;
     delivered = 0;
     if (!busy) return; // idle: keep the last estimate
-    rate = rate ? 0.7 * rate + 0.3 * sample : sample;
+    // Fall fast, rise slowly: a sudden slowdown is caught within a sample or two.
+    const w = sample < rate ? 0.7 : 0.3;
+    rate = rate ? (1 - w) * rate + w * sample : sample;
     limit = Math.min(MAX_TOTAL, Math.max(MIN_TOTAL, rate * TARGET_QUEUE_S));
     resumeSome();
   }, 250);
